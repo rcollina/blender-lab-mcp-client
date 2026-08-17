@@ -58,7 +58,7 @@ the equivalent `bpy` Python and sending it through the Blender Lab add-on's
 2. Install this package:
 
    ```bash
-   git clone https://github.com/<your-username>/blender-lab-mcp-client.git
+   git clone https://github.com/A-to-PC/blender-lab-mcp-client.git
    cd blender-lab-mcp-client
    pip install -e .
    ```

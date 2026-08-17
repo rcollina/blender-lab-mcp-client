@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "blender-lab-mcp-client"
+version = "0.1.0"
+description = "MCP client that speaks the official Blender Lab 'MCP' add-on's actual wire protocol (blender.org/lab/mcp-server) — a drop-in for the 27 tools djeada/blender-mcp-server exposes, since that package's client only matches its own bundled add-on, not the official one."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Adam Djellouli", email = "adam@djellouli.com" },
+]
+maintainers = [
+    { name = "Jason" },
+]
+requires-python = ">=3.10"
+keywords = ["3d", "ai", "blender", "claude", "mcp", "model-context-protocol"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "mcp>=1.0.0,<2.0",
+]
+
+[project.scripts]
+blender-lab-mcp-client = "blender_lab_mcp_client.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/blender_lab_mcp_client"]

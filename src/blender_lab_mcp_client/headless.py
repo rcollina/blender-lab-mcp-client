@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
+import shutil
 import tempfile
 import textwrap
 import time
@@ -18,7 +20,46 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from blender_lab_mcp_client.config import Settings
+from blender_lab_mcp_client.paths import READ, _validate_path
+
+logger = logging.getLogger(__name__)
+
 RESULT_PREFIX = "__BLENDER_MCP_RESULT__="
+
+_logged_binary: str | None = None
+
+
+def resolve_blender_binary(explicit: str | None = None) -> str:
+    """Find the Blender executable: explicit arg, else $BLENDER_BIN, else PATH.
+
+    Returns an absolute path. Raises FileNotFoundError with an actionable
+    message when nothing usable is found. The resolved path is logged (to
+    stderr, via logging) the first time it is used.
+    """
+    global _logged_binary
+
+    configured = explicit or os.environ.get("BLENDER_BIN")
+    if configured:
+        found = shutil.which(configured)
+        if found is None:
+            raise FileNotFoundError(
+                f"Blender executable not found: BLENDER_BIN is set to {configured!r}, which is not an "
+                "existing executable file or a command on PATH."
+            )
+    else:
+        found = shutil.which("blender")
+        if found is None:
+            raise FileNotFoundError(
+                "Blender executable not found: set BLENDER_BIN to the full path of the blender "
+                "executable (blender.exe on Windows) or put `blender` on PATH."
+            )
+
+    resolved = os.path.abspath(found)
+    if _logged_binary is None:
+        _logged_binary = resolved
+        logger.info("Headless Blender binary: %s", resolved)
+    return resolved
 
 
 def _cap_output(text: str, limit: int = 50000) -> str:
@@ -101,11 +142,26 @@ def _build_wrapper_script(code_path: Path, args_path: Path) -> str:
     )
 
 
+def _failure(error: str, start: float) -> dict[str, Any]:
+    return {
+        "result": None,
+        "stdout": "",
+        "stderr": "",
+        "error": error,
+        "duration_seconds": round(time.monotonic() - start, 4),
+        "timed_out": False,
+        "cancelled": False,
+    }
+
+
 class HeadlessBlenderExecutor:
     """Run Blender scripts in a separate headless Blender process."""
 
-    def __init__(self, blender_binary: str | None = None):
-        self.blender_binary = blender_binary or os.environ.get("BLENDER_BIN", "blender")
+    def __init__(self, blender_binary: str | None = None, settings: Settings | None = None):
+        self.settings = settings or Settings()
+        # Resolved lazily at execute() time so a missing binary becomes a
+        # normal error result instead of failing construction.
+        self.blender_binary = blender_binary
 
     async def execute(
         self,
@@ -123,11 +179,22 @@ class HeadlessBlenderExecutor:
         if not code and not script_path:
             raise ValueError("Either 'code' or 'script_path' must be provided")
 
+        # Same restriction as the tool layer (idempotent on already-validated paths).
+        if script_path is not None:
+            script_path = _validate_path(script_path, self.settings, mode=READ, param="script_path")
+        if blend_file:
+            blend_file = _validate_path(blend_file, self.settings, mode=READ, param="blend_file")
+
         if script_path is not None:
             code = Path(script_path).read_text(encoding="utf-8")
 
         args = args or {}
         start = time.monotonic()
+
+        try:
+            blender_binary = resolve_blender_binary(self.blender_binary)
+        except FileNotFoundError as exc:
+            return _failure(str(exc), start)
 
         with tempfile.TemporaryDirectory(prefix="blender-mcp-headless-") as tmpdir:
             tmp = Path(tmpdir)
@@ -139,18 +206,22 @@ class HeadlessBlenderExecutor:
             args_path.write_text(json.dumps(args), encoding="utf-8")
             wrapper_path.write_text(_build_wrapper_script(code_path, args_path), encoding="utf-8")
 
-            cmd = [self.blender_binary, "-b"]
+            cmd = [blender_binary, "-b"]
             if factory_startup is not False:
                 cmd.append("--factory-startup")
             if blend_file:
                 cmd.append(blend_file)
             cmd.extend(["--python", str(wrapper_path)])
 
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            # Argument list, never a shell: nothing here is interpreted by cmd/sh.
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except OSError as exc:
+                return _failure(f"Could not start Blender ({blender_binary}): {exc}", start)
             if process_holder is not None:
                 process_holder["process"] = proc
 

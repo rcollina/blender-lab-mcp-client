@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "blender-lab-mcp-client"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP client that speaks the official Blender Lab 'MCP' add-on's actual wire protocol (blender.org/lab/mcp-server) — a drop-in for the 27 tools djeada/blender-mcp-server exposes, since that package's client only matches its own bundled add-on, not the official one."
 readme = "README.md"
 license = "MIT"
@@ -25,7 +25,13 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    "mcp>=1.0.0,<2.0",
+    "mcp>=1.23.0,<2.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
 ]
 
 [project.urls]
@@ -38,3 +44,7 @@ blender-lab-mcp-client = "blender_lab_mcp_client.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/blender_lab_mcp_client"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

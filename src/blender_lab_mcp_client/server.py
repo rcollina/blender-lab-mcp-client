@@ -20,18 +20,31 @@ against the official add-on instead of djeada's bundled one.
 import asyncio
 import json
 import logging
+import os
+import sys
+import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import ToolAnnotations
 
+from blender_lab_mcp_client.config import (
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    MCP_BIND_HOST,
+    ConfigError,
+    Settings,
+    load_settings,
+)
 from blender_lab_mcp_client.headless import HeadlessBlenderExecutor, HeadlessJobManager
+from blender_lab_mcp_client.paths import READ, WRITE, _validate_path
 
 logger = logging.getLogger(__name__)
 
-BLENDER_HOST = "127.0.0.1"
-BLENDER_PORT = 9876
 HEADLESS_JOB_MANAGER = HeadlessJobManager()
 
 # ---------------------------------------------------------------------------
@@ -239,40 +252,66 @@ if principled:
 result = {"name": mat.name, "filepath": params["filepath"]}
 """
 
+# Rendering must not leave the user's open scene changed: every setting we
+# touch is saved first and restored in `finally`, even if the render fails.
 _CODE_RENDER_STILL = """
 scene = bpy.context.scene
-scene.render.filepath = params["output_path"]
-if params.get("resolution_x"):
-    scene.render.resolution_x = params["resolution_x"]
-if params.get("resolution_y"):
-    scene.render.resolution_y = params["resolution_y"]
-if params.get("engine"):
-    scene.render.engine = params["engine"]
-bpy.ops.render.render(write_still=True)
-result = {
-    "output_path": scene.render.filepath,
+_orig = {
+    "filepath": scene.render.filepath,
     "engine": scene.render.engine,
     "resolution_x": scene.render.resolution_x,
     "resolution_y": scene.render.resolution_y,
 }
+try:
+    scene.render.filepath = params["output_path"]
+    if params.get("resolution_x"):
+        scene.render.resolution_x = params["resolution_x"]
+    if params.get("resolution_y"):
+        scene.render.resolution_y = params["resolution_y"]
+    if params.get("engine"):
+        scene.render.engine = params["engine"]
+    bpy.ops.render.render(write_still=True)
+    result = {
+        "output_path": scene.render.filepath,
+        "engine": scene.render.engine,
+        "resolution_x": scene.render.resolution_x,
+        "resolution_y": scene.render.resolution_y,
+    }
+finally:
+    scene.render.filepath = _orig["filepath"]
+    scene.render.engine = _orig["engine"]
+    scene.render.resolution_x = _orig["resolution_x"]
+    scene.render.resolution_y = _orig["resolution_y"]
 """
 
 _CODE_RENDER_ANIMATION = """
 scene = bpy.context.scene
-scene.render.filepath = params["output_path"]
-if params.get("frame_start") is not None:
-    scene.frame_start = params["frame_start"]
-if params.get("frame_end") is not None:
-    scene.frame_end = params["frame_end"]
-if params.get("engine"):
-    scene.render.engine = params["engine"]
-bpy.ops.render.render(animation=True)
-result = {
-    "output_path": scene.render.filepath,
+_orig = {
+    "filepath": scene.render.filepath,
     "engine": scene.render.engine,
     "frame_start": scene.frame_start,
     "frame_end": scene.frame_end,
 }
+try:
+    scene.render.filepath = params["output_path"]
+    if params.get("frame_start") is not None:
+        scene.frame_start = params["frame_start"]
+    if params.get("frame_end") is not None:
+        scene.frame_end = params["frame_end"]
+    if params.get("engine"):
+        scene.render.engine = params["engine"]
+    bpy.ops.render.render(animation=True)
+    result = {
+        "output_path": scene.render.filepath,
+        "engine": scene.render.engine,
+        "frame_start": scene.frame_start,
+        "frame_end": scene.frame_end,
+    }
+finally:
+    scene.render.filepath = _orig["filepath"]
+    scene.render.engine = _orig["engine"]
+    scene.frame_start = _orig["frame_start"]
+    scene.frame_end = _orig["frame_end"]
 """
 
 _CODE_EXPORT_GLTF = """
@@ -300,17 +339,59 @@ bpy.ops.ed.redo()
 result = {"status": "redone"}
 """
 
+# Result shape matches headless.py: result / stdout / stderr / error /
+# duration_seconds / timed_out / cancelled. Output capture is Python-level
+# only (redirect_stdout/stderr); C-level writes by Blender are not captured.
 _CODE_PYTHON_EXECUTE = """
+import io
+import time
+import traceback
 import mathutils
+from contextlib import redirect_stdout, redirect_stderr
+
+_LIMIT = 50000
+
+def _cap(text):
+    if len(text) <= _LIMIT:
+        return text
+    return text[:_LIMIT] + "\\n... (truncated, {} total chars)".format(len(text))
+
+def _safe(value):
+    try:
+        json.dumps(value)
+        return value
+    except (TypeError, ValueError):
+        return repr(value)
+
 _user_code = params.get("code")
 _script_path = params.get("script_path")
 _args = params.get("args") or {}
-if _script_path:
-    with open(_script_path, "r") as _f:
-        _user_code = _f.read()
-_ns = {"bpy": bpy, "mathutils": mathutils, "args": _args}
-exec(_user_code, _ns)
-result = {"result": _ns.get("__result__")}
+_out = io.StringIO()
+_err = io.StringIO()
+_error = None
+_ns = {"bpy": bpy, "mathutils": mathutils, "args": _args, "__result__": None}
+_t0 = time.monotonic()
+try:
+    if _user_code and _script_path:
+        raise ValueError("Provide either 'code' or 'script_path', not both")
+    if not _user_code and not _script_path:
+        raise ValueError("Either 'code' or 'script_path' must be provided")
+    if _script_path:
+        with open(_script_path, "r", encoding="utf-8") as _f:
+            _user_code = _f.read()
+    with redirect_stdout(_out), redirect_stderr(_err):
+        exec(compile(_user_code, "<mcp-bridge-script>", "exec"), _ns)
+except (Exception, SystemExit):
+    _error = traceback.format_exc().strip()
+result = {
+    "result": None if _error else _safe(_ns.get("__result__")),
+    "stdout": _cap(_out.getvalue()),
+    "stderr": _cap(_err.getvalue()),
+    "error": _error,
+    "duration_seconds": round(time.monotonic() - _t0, 4),
+    "timed_out": False,
+    "cancelled": False,
+}
 """
 
 _COMMAND_CODE: dict[str, str] = {
@@ -343,25 +424,44 @@ _COMMAND_CODE: dict[str, str] = {
 # real deferred-job mechanism requires the executed code itself to set a
 # `check_is_finished` callable, which isn't practical to synthesize
 # generically here. Instead, async jobs run synchronously and are recorded as
-# already "succeeded" so `blender_job_status` still behaves sensibly for
+# already finished so `blender_job_status` still behaves sensibly for
 # callers. Use `transport="headless"` (see below) for genuinely long-running
 # work — that path already runs as a real background process.
-_FAKE_JOBS: dict[str, dict[str, object]] = {}
+# Only the most recent _MAX_FAKE_JOBS records are kept.
+_MAX_FAKE_JOBS = 100
+_FAKE_JOBS: "OrderedDict[str, dict[str, object]]" = OrderedDict()
+
+
+def _record_fake_job(job: dict[str, object]) -> None:
+    _FAKE_JOBS[str(job["job_id"])] = job
+    while len(_FAKE_JOBS) > _MAX_FAKE_JOBS:
+        _FAKE_JOBS.popitem(last=False)
+
+
+def _build_header(params: dict) -> str:
+    """The snippet prologue: imports plus `params`, passed as a JSON literal.
+
+    json.dumps output is pure ASCII (ensure_ascii), so its repr() is a safe
+    Python string literal whatever quotes, backslashes or newlines `params`
+    contains; user values are never spliced into code.
+    """
+    return "import bpy\nimport json\nparams = json.loads({!r})\n".format(json.dumps(params))
 
 
 def _build_code(command: str, params: dict) -> str:
     body = _COMMAND_CODE.get(command)
     if body is None:
         raise RuntimeError("Unsupported command: {!r}".format(command))
-    return "import bpy\nimport json\nparams = json.loads({!r})\n{}".format(json.dumps(params), body)
+    return _build_header(params) + body
 
 
 class BlenderConnection:
     """Async TCP client that communicates with the Blender Lab add-on."""
 
-    def __init__(self, host: str = BLENDER_HOST, port: int = BLENDER_PORT):
+    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, settings: Settings | None = None):
         self.host = host
         self.port = port
+        self.settings = settings or Settings(host=host, port=port)
         self._lock = asyncio.Lock()
 
     async def connect(self):
@@ -400,18 +500,52 @@ class BlenderConnection:
                 if writer is not None:
                     writer.close()
 
+    async def _run_python(self, params: dict) -> dict:
+        """Run user Python in Blender, enforcing `timeout_seconds` client-side.
+
+        On timeout we stop *waiting* and close the socket, but Blender keeps
+        executing whatever it already received: the add-on offers no way to
+        interrupt running code.
+        """
+        timeout = params.get("timeout_seconds")
+        start = time.monotonic()
+        try:
+            return await asyncio.wait_for(
+                self._send_execute(_build_code("python.execute", params)),
+                timeout=(timeout if timeout and timeout > 0 else None),
+            )
+        except asyncio.TimeoutError:
+            return {
+                "result": None,
+                "stdout": "",
+                "stderr": "",
+                "error": (
+                    f"Timed out after {timeout}s waiting for Blender. The code was NOT stopped: "
+                    "it may still be running inside Blender, and Blender may stay busy until it finishes."
+                ),
+                "duration_seconds": round(time.monotonic() - start, 4),
+                "timed_out": True,
+                "cancelled": False,
+            }
+
     async def send_command(self, command: str, params: dict | None = None) -> Any:
         """Send a command to Blender and return the result."""
         params = params or {}
 
+        if command == "python.execute":
+            return await self._run_python(params)
+
         if command == "python.execute_async":
-            exec_result = await self._send_execute(_build_code("python.execute", params))
+            exec_result = await self._run_python(params)
             job_id = "bridge-sync-" + str(uuid.uuid4())
-            _FAKE_JOBS[job_id] = {
-                "job_id": job_id,
-                "status": "succeeded",
-                "result": exec_result,
-            }
+            failed = bool(exec_result.get("error"))
+            _record_fake_job(
+                {
+                    "job_id": job_id,
+                    "status": "failed" if failed else "succeeded",
+                    "result": exec_result,
+                }
+            )
             return {"job_id": job_id}
 
         if command == "job.status":
@@ -425,8 +559,9 @@ class BlenderConnection:
             job = _FAKE_JOBS.get(job_id)
             if job is None:
                 raise RuntimeError("Unknown job_id: {}".format(job_id))
-            job["status"] = "cancelled"
-            return {"job_id": job_id, "status": "cancelled"}
+            # Bridge "jobs" have always finished by the time they are recorded,
+            # so there is nothing to cancel; don't rewrite their real outcome.
+            return {"job_id": job_id, "status": job["status"]}
 
         if command == "job.list":
             return {"jobs": list(_FAKE_JOBS.values())}
@@ -434,34 +569,75 @@ class BlenderConnection:
         return await self._send_execute(_build_code(command, params))
 
 
-@asynccontextmanager
-async def blender_lifespan(server: FastMCP):
-    """Manage the Blender connection lifecycle."""
-    conn = BlenderConnection()
-    try:
-        await conn.connect()
-    except OSError:
-        logger.warning("Could not connect to Blender on startup. Will retry on first tool call.")
-    yield conn
-    await conn.disconnect()
-
-
-mcp = FastMCP(
-    "Blender Lab MCP Client",
-    lifespan=blender_lifespan,
-    log_level="INFO",
-)
-
-
 def _get_conn(ctx: Context) -> BlenderConnection:
     return ctx.request_context.lifespan_context  # type: ignore[no-any-return]
+
+
+def _safe_path(ctx: Context, value: str, mode: str, param: str) -> str:
+    return _validate_path(value, _get_conn(ctx).settings, mode=mode, param=param)
+
+
+def _safe_optional_path(ctx: Context, value: str | None, mode: str, param: str) -> str | None:
+    return None if value is None else _safe_path(ctx, value, mode, param)
+
+
+def _check_transport(transport: str) -> None:
+    # A typo must not silently fall through to the live Blender session.
+    if transport not in ("bridge", "headless"):
+        raise ValueError(f"Unknown transport {transport!r}: expected 'bridge' or 'headless'")
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    fn: Callable[..., Any]
+    description: str
+    # "read" (never changes anything), "python" (arbitrary code execution) or
+    # "write" (every other tool).
+    category: str = "write"
+    # Hard to undo or with effects outside the scene (deletion, undo/redo,
+    # writing files, running arbitrary code, killing a job).
+    destructive: bool = False
+
+    @property
+    def annotations(self) -> ToolAnnotations:
+        read = self.category == "read"
+        return ToolAnnotations(
+            readOnlyHint=read,
+            destructiveHint=False if read else self.destructive,
+            openWorldHint=False,
+        )
+
+
+# Filled by the `_tool` decorator below; `build_server` registers from it so a
+# server instance only ever exposes the tools its settings allow.
+_TOOLS: list[ToolSpec] = []
+
+
+def _tool(*, name: str, description: str, category: str = "write", destructive: bool = False):
+    def decorator(fn):
+        _TOOLS.append(
+            ToolSpec(name=name, fn=fn, description=description, category=category, destructive=destructive)
+        )
+        return fn
+
+    return decorator
+
+
+def _is_enabled(spec: ToolSpec, settings: Settings) -> bool:
+    if settings.readonly:
+        return spec.category == "read"
+    if settings.disable_python:
+        return spec.category != "python"
+    return True
 
 
 # -- Scene tools --
 
 
-@mcp.tool(
+@_tool(
     name="blender_scene_get_info",
+    category="read",
     description="Get information about the current Blender scene including name, frame range, render engine, resolution, and object count.",
 )
 async def scene_get_info(ctx: Context) -> str:
@@ -469,8 +645,9 @@ async def scene_get_info(ctx: Context) -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_scene_list_objects",
+    category="read",
     description="List all objects in the current Blender scene. Optionally filter by type (MESH, CAMERA, LIGHT, EMPTY, CURVE, etc.).",
 )
 async def scene_list_objects(ctx: Context, type: str | None = None) -> str:
@@ -481,8 +658,9 @@ async def scene_list_objects(ctx: Context, type: str | None = None) -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_object_get_transform",
+    category="read",
     description="Get the position, rotation, and scale of a Blender object by name.",
 )
 async def object_get_transform(ctx: Context, name: str) -> str:
@@ -490,8 +668,9 @@ async def object_get_transform(ctx: Context, name: str) -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_object_get_hierarchy",
+    category="read",
     description="Get the parent/child hierarchy of objects. If name is provided, returns the subtree for that object. Otherwise returns the full scene hierarchy.",
 )
 async def object_get_hierarchy(ctx: Context, name: str | None = None) -> str:
@@ -502,8 +681,9 @@ async def object_get_hierarchy(ctx: Context, name: str | None = None) -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_material_list",
+    category="read",
     description="List all materials in the Blender file.",
 )
 async def material_list(ctx: Context) -> str:
@@ -514,7 +694,7 @@ async def material_list(ctx: Context) -> str:
 # -- Object mutation tools --
 
 
-@mcp.tool(
+@_tool(
     name="blender_object_create",
     description="Create a new mesh object in Blender. Supported types: cube, sphere, cylinder, plane, cone, torus.",
 )
@@ -534,8 +714,9 @@ async def object_create(
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_object_delete",
+    destructive=True,
     description="Delete an object from the Blender scene by name.",
 )
 async def object_delete(ctx: Context, name: str) -> str:
@@ -543,7 +724,7 @@ async def object_delete(ctx: Context, name: str) -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_object_translate",
     description="Move an object. Provide either 'location' for absolute positioning or 'offset' for relative movement.",
 )
@@ -562,7 +743,7 @@ async def object_translate(
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_object_rotate",
     description="Set the rotation of an object. Provide rotation as [x, y, z] angles. By default angles are in degrees.",
 )
@@ -578,7 +759,7 @@ async def object_rotate(
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_object_scale",
     description="Set the scale of an object. Provide scale as [x, y, z].",
 )
@@ -587,7 +768,7 @@ async def object_scale(ctx: Context, name: str, scale: list[float]) -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_object_duplicate",
     description="Duplicate an object in the Blender scene. Optionally provide a new name.",
 )
@@ -602,7 +783,7 @@ async def object_duplicate(ctx: Context, name: str, new_name: str | None = None)
 # -- Material tools --
 
 
-@mcp.tool(
+@_tool(
     name="blender_material_create",
     description="Create a new material. Optionally set an initial base color as [r, g, b] with values 0-1.",
 )
@@ -614,7 +795,7 @@ async def material_create(ctx: Context, name: str = "Material", color: list[floa
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_material_assign",
     description="Assign an existing material to an object.",
 )
@@ -623,7 +804,7 @@ async def material_assign(ctx: Context, object: str, material: str) -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_material_set_color",
     description="Set the base color of a material. Color is [r, g, b] with values 0-1.",
 )
@@ -632,11 +813,12 @@ async def material_set_color(ctx: Context, name: str, color: list[float]) -> str
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_material_set_texture",
     description="Set an image texture as the base color of a material. Provide the file path to the image.",
 )
 async def material_set_texture(ctx: Context, name: str, filepath: str) -> str:
+    filepath = _safe_path(ctx, filepath, READ, "filepath")
     result = await _get_conn(ctx).send_command("material.set_texture", {"name": name, "filepath": filepath})
     return json.dumps(result, indent=2)
 
@@ -644,8 +826,9 @@ async def material_set_texture(ctx: Context, name: str, filepath: str) -> str:
 # -- Render tools --
 
 
-@mcp.tool(
+@_tool(
     name="blender_render_still",
+    destructive=True,
     description=(
         "Render the current scene as a still image. Optionally set output path, resolution, and render engine "
         "(BLENDER_EEVEE, CYCLES, etc.). Use transport='bridge' for the live Blender add-on session, or "
@@ -662,6 +845,9 @@ async def render_still(
     blend_file: str | None = None,
     factory_startup: bool | None = None,
 ) -> str:
+    _check_transport(transport)
+    output_path = _safe_path(ctx, output_path, WRITE, "output_path")
+    blend_file = _safe_optional_path(ctx, blend_file, READ, "blend_file")
     if transport == "headless":
         code = """
 import bpy
@@ -681,7 +867,7 @@ __result__ = {
     "resolution_y": scene.render.resolution_y,
 }
 """
-        executor = HeadlessBlenderExecutor()
+        executor = HeadlessBlenderExecutor(settings=_get_conn(ctx).settings)
         result = await executor.execute(
             code=code,
             args={
@@ -705,8 +891,9 @@ __result__ = {
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_render_animation",
+    destructive=True,
     description=(
         "Render an animation. Optionally set output path, frame range, and render engine. "
         "Use transport='bridge' for the live Blender add-on session, or transport='headless' with a blend_file "
@@ -723,6 +910,9 @@ async def render_animation(
     blend_file: str | None = None,
     factory_startup: bool | None = None,
 ) -> str:
+    _check_transport(transport)
+    output_path = _safe_path(ctx, output_path, WRITE, "output_path")
+    blend_file = _safe_optional_path(ctx, blend_file, READ, "blend_file")
     if transport == "headless":
         code = """
 import bpy
@@ -742,7 +932,7 @@ __result__ = {
     "frame_end": scene.frame_end,
 }
 """
-        executor = HeadlessBlenderExecutor()
+        executor = HeadlessBlenderExecutor(settings=_get_conn(ctx).settings)
         result = await executor.execute(
             code=code,
             args={
@@ -769,29 +959,35 @@ __result__ = {
 # -- Export tools --
 
 
-@mcp.tool(
+@_tool(
     name="blender_export_gltf",
+    destructive=True,
     description="Export the scene as glTF/GLB. Provide the output file path.",
 )
 async def export_gltf(ctx: Context, filepath: str) -> str:
+    filepath = _safe_path(ctx, filepath, WRITE, "filepath")
     result = await _get_conn(ctx).send_command("export.gltf", {"filepath": filepath})
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_export_obj",
+    destructive=True,
     description="Export the scene as OBJ. Provide the output file path.",
 )
 async def export_obj(ctx: Context, filepath: str) -> str:
+    filepath = _safe_path(ctx, filepath, WRITE, "filepath")
     result = await _get_conn(ctx).send_command("export.obj", {"filepath": filepath})
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_export_fbx",
+    destructive=True,
     description="Export the scene as FBX. Provide the output file path.",
 )
 async def export_fbx(ctx: Context, filepath: str) -> str:
+    filepath = _safe_path(ctx, filepath, WRITE, "filepath")
     result = await _get_conn(ctx).send_command("export.fbx", {"filepath": filepath})
     return json.dumps(result, indent=2)
 
@@ -799,8 +995,9 @@ async def export_fbx(ctx: Context, filepath: str) -> str:
 # -- History tools --
 
 
-@mcp.tool(
+@_tool(
     name="blender_history_undo",
+    destructive=True,
     description="Undo the last operation in Blender.",
 )
 async def history_undo(ctx: Context) -> str:
@@ -808,8 +1005,9 @@ async def history_undo(ctx: Context) -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_history_redo",
+    destructive=True,
     description="Redo the last undone operation in Blender.",
 )
 async def history_redo(ctx: Context) -> str:
@@ -820,16 +1018,25 @@ async def history_redo(ctx: Context) -> str:
 # -- Python execution tools --
 
 
-@mcp.tool(
+@_tool(
     name="blender_python_exec",
+    category="python",
+    destructive=True,
     description=(
         "Execute a Python script in Blender's context synchronously. "
         "Provide either 'code' (inline Python string) or 'script_path' (path to a .py file), not both. "
         "The script has access to 'bpy', 'mathutils', and an 'args' dict with your supplied arguments. "
         "Set '__result__' in the script to return a JSON-serializable value. "
-        "Returns the result, captured stdout/stderr, and execution duration. "
-        "Use transport='bridge' for the live Blender add-on session, or transport='headless' to run the script "
-        "in a separate `blender -b` process. For long-running tasks like baking, use blender_python_exec_async."
+        "Returns {result, stdout, stderr, error, duration_seconds, timed_out, cancelled}; stdout/stderr capture "
+        "Python-level output only and are capped at 50000 characters. "
+        "Use transport='bridge' for the live Blender add-on session (blocks Blender until the code finishes), or "
+        "transport='headless' to run the script in a separate `blender -b` process. "
+        "timeout_seconds: with transport='headless' the process is killed on timeout. With transport='bridge' it is "
+        "enforced client-side only: this tool returns a timeout error, but code already running inside Blender is "
+        "NOT stopped and Blender may stay busy until it finishes. "
+        "SECURITY: this code runs with the full privileges of the Blender process. The path restrictions "
+        "(BLENDER_LAB_MCP_WRITE_DIRS / READ_DIRS) guard only the structured tools; code executed here can read "
+        "and write anywhere and bypass them. Real containment requires BLENDER_LAB_MCP_DISABLE_PYTHON=1."
     ),
 )
 async def python_exec(
@@ -842,8 +1049,11 @@ async def python_exec(
     blend_file: str | None = None,
     factory_startup: bool | None = None,
 ) -> str:
+    _check_transport(transport)
+    script_path = _safe_optional_path(ctx, script_path, READ, "script_path")
+    blend_file = _safe_optional_path(ctx, blend_file, READ, "blend_file")
     if transport == "headless":
-        executor = HeadlessBlenderExecutor()
+        executor = HeadlessBlenderExecutor(settings=_get_conn(ctx).settings)
         result = await executor.execute(
             code=code,
             script_path=script_path,
@@ -866,15 +1076,21 @@ async def python_exec(
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_python_exec_async",
+    category="python",
+    destructive=True,
     description=(
-        "Start a long-running Python script in Blender asynchronously. "
-        "Same parameters as blender_python_exec. Returns a job_id immediately. "
-        "Use blender_job_status to poll for completion, and blender_job_cancel to abort. "
-        "The script can check '__cancel_event__.is_set()' to detect cancellation. "
-        "Ideal for fluid baking, rigid body simulation, or heavy scene generation. "
-        "Use transport='headless' to run the job in a separate background Blender process."
+        "Start a Python script as a job. Same parameters as blender_python_exec. Returns a job_id. "
+        "IMPORTANT: with transport='bridge' (the default) this is NOT asynchronous: the script runs synchronously "
+        "inside the live Blender session, this call returns only after it has finished, and the job is already "
+        "complete (succeeded/failed) when you poll it. Real background execution requires transport='headless', "
+        "which runs the job in a separate `blender -b` process and returns immediately; poll it with "
+        "blender_job_status. blender_job_cancel terminates a headless job's process (scripts get no cancellation "
+        "signal). Headless suits fluid baking, rigid body simulation, or heavy scene generation. "
+        "SECURITY: the script runs with full privileges and can bypass the path restrictions "
+        "(BLENDER_LAB_MCP_WRITE_DIRS / READ_DIRS), which guard only the structured tools; real containment "
+        "requires BLENDER_LAB_MCP_DISABLE_PYTHON=1."
     ),
 )
 async def python_exec_async(
@@ -887,8 +1103,11 @@ async def python_exec_async(
     blend_file: str | None = None,
     factory_startup: bool | None = None,
 ) -> str:
+    _check_transport(transport)
+    script_path = _safe_optional_path(ctx, script_path, READ, "script_path")
+    blend_file = _safe_optional_path(ctx, blend_file, READ, "blend_file")
     if transport == "headless":
-        executor = HeadlessBlenderExecutor()
+        executor = HeadlessBlenderExecutor(settings=_get_conn(ctx).settings)
         job_id = await HEADLESS_JOB_MANAGER.create_job(
             executor,
             code=code,
@@ -913,8 +1132,9 @@ async def python_exec_async(
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_job_status",
+    category="read",
     description=(
         "Get the status of an async Blender job. Returns job_id, status "
         "(queued/running/succeeded/failed/cancelled), timestamps, result, stdout, stderr, and error. "
@@ -929,11 +1149,13 @@ async def job_status(ctx: Context, job_id: str) -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_job_cancel",
+    destructive=True,
     description=(
         "Cancel a running or queued async Blender job. "
-        "The job's __cancel_event__ is set; scripts that check it will stop gracefully."
+        "For headless jobs the background Blender process is terminated; scripts get no chance to clean up. "
+        "Bridge jobs run synchronously and have already finished, so cancelling them changes nothing."
     ),
 )
 async def job_cancel(ctx: Context, job_id: str) -> str:
@@ -944,8 +1166,9 @@ async def job_cancel(ctx: Context, job_id: str) -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(
+@_tool(
     name="blender_job_list",
+    category="read",
     description="List known async Blender jobs with their IDs, statuses, and creation timestamps.",
 )
 async def job_list(ctx: Context) -> str:
@@ -953,14 +1176,81 @@ async def job_list(ctx: Context) -> str:
     try:
         bridge_result = await _get_conn(ctx).send_command("job.list")
         bridge_jobs = bridge_result.get("jobs", [])
-    except Exception:
+    except (ConnectionError, RuntimeError):
         bridge_jobs = []
     result = {"jobs": bridge_jobs + headless_jobs}
     return json.dumps(result, indent=2)
 
 
+def build_server(settings: Settings | None = None) -> FastMCP:
+    """Create a FastMCP server whose tools and connection follow `settings`."""
+    settings = settings or load_settings()
+
+    @asynccontextmanager
+    async def blender_lifespan(server: FastMCP):
+        """Manage the Blender connection lifecycle."""
+        conn = BlenderConnection(settings.host, settings.port, settings=settings)
+        try:
+            await conn.connect()
+        except OSError:
+            logger.warning("Could not connect to Blender on startup. Will retry on first tool call.")
+        yield conn
+        await conn.disconnect()
+
+    # host/port only matter for streamable-http; the host is never configurable.
+    # FastMCP turns on DNS-rebinding protection for loopback hosts by itself.
+    server = FastMCP(
+        "Blender Lab MCP Client",
+        lifespan=blender_lifespan,
+        log_level="INFO",
+        host=MCP_BIND_HOST,
+        port=settings.mcp_port,
+    )
+    for spec in _TOOLS:
+        if _is_enabled(spec, settings):
+            server.add_tool(
+                spec.fn, name=spec.name, description=spec.description, annotations=spec.annotations
+            )
+    return server
+
+
+def _log_startup(settings: Settings) -> None:
+    logger.info("Using Blender add-on at %s:%s; mode: %s", settings.host, settings.port, settings.mode)
+    if not settings.paths_restricted:
+        logger.warning(
+            "Path arguments are NOT restricted: set BLENDER_LAB_MCP_WRITE_DIRS (and optionally "
+            "BLENDER_LAB_MCP_READ_DIRS) to confine render/export/texture/script/.blend paths."
+        )
+        return
+    logger.info("Path restrictions: write=%s read=%s", list(settings.write_dirs), list(settings.read_dirs))
+    for d in (*settings.write_dirs, *settings.read_dirs):
+        if not os.path.isdir(d):
+            logger.warning("Configured directory does not exist: %s", d)
+    if settings.python_enabled:
+        logger.warning(
+            "Python execution is enabled: code run through blender_python_exec can bypass the path "
+            "restrictions. Set BLENDER_LAB_MCP_DISABLE_PYTHON=1 for real containment."
+        )
+
+
 def main():
-    mcp.run(transport="stdio")
+    # stdout carries the MCP protocol: everything we log goes to stderr.
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    try:
+        settings = load_settings()
+    except ConfigError as e:
+        print(f"blender-lab-mcp-client: configuration error: {e}", file=sys.stderr)
+        raise SystemExit(2) from None
+    server = build_server(settings)
+    _log_startup(settings)
+    if settings.transport == "streamable-http":
+        logger.warning(
+            "Serving MCP over HTTP on http://%s:%s/mcp with NO authentication: any local process can "
+            "drive Blender through it.",
+            MCP_BIND_HOST,
+            settings.mcp_port,
+        )
+    server.run(transport=settings.transport)
 
 
 if __name__ == "__main__":

@@ -35,9 +35,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/A-to-PC/blender-lab-mcp-client"
-Repository = "https://github.com/A-to-PC/blender-lab-mcp-client"
-Issues = "https://github.com/A-to-PC/blender-lab-mcp-client/issues"
+Homepage = "https://github.com/rcollina/blender-lab-mcp-client"
+Repository = "https://github.com/rcollina/blender-lab-mcp-client"
+Issues = "https://github.com/rcollina/blender-lab-mcp-client/issues"
 
 [project.scripts]
 blender-lab-mcp-client = "blender_lab_mcp_client.server:main"

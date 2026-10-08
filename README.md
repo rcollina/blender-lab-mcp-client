@@ -58,7 +58,7 @@ the equivalent `bpy` Python and sending it through the Blender Lab add-on's
 2. Get this package (Python ≥ 3.10, [uv](https://docs.astral.sh/uv/) recommended):
 
    ```bash
-   git clone https://github.com/A-to-PC/blender-lab-mcp-client.git
+   git clone https://github.com/rcollina/blender-lab-mcp-client.git
    cd blender-lab-mcp-client
    uv sync
    ```
